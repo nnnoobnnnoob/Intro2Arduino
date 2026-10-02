@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build ESP32-S3 hardware test",
+			"type": "shell",
+			"command": "C:\\Users\\NeilN\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-c",
+				"import os,subprocess,sys; os.environ.__setitem__(sys.argv[1],sys.argv[2]+os.pathsep+os.environ[sys.argv[1]]); os.environ.__setitem__(sys.argv[3],sys.argv[4]); sys.exit(subprocess.call(sys.argv[5:]))",
+				"PATH",
+				"C:\\Program Files\\Git\\cmd",
+				"PLATFORMIO_CORE_DIR",
+				"C:\\pio",
+				"C:\\Users\\NeilN\\.platformio\\penv\\Scripts\\platformio.exe",
+				"run"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
