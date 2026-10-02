@@ -1,9 +1,13 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_VL53L0X.h>
-#include <ESP_I2S.h>
+#include <Audio.h>
+#include <WiFi.h>
 #include <math.h>
 
+#include "secrets.h"
+
+constexpr uint8_t BUTTON_PIN = 47;
 constexpr uint8_t RING1_PIN = 4;
 constexpr uint8_t RING2_PIN = 5;
 constexpr uint8_t I2C_SDA_PIN = 8;
@@ -16,26 +20,39 @@ constexpr uint16_t RING_PIXEL_COUNT = 12;
 constexpr uint32_t RING_STEP_MS = 120;
 constexpr uint32_t SENSOR_INTERVAL_MS = 250;
 constexpr uint32_t ONBOARD_COLOR_INTERVAL_MS = 1000;
-constexpr uint32_t AUDIO_SAMPLE_RATE = 44100;
-constexpr uint32_t AUDIO_SAMPLE_COUNT = AUDIO_SAMPLE_RATE;
-constexpr uint32_t AUDIO_DURATION_US = 1000000;
-constexpr float TONE_FREQUENCY_HZ = 1000.0f;
+constexpr uint16_t DEBOUNCE_MS = 50;
+constexpr float DISTANCE_NEAR_M = 0.10f;
+constexpr float DISTANCE_FAR_M = 0.30f;
+constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
+
+enum class Mode {
+  Mode1,
+  Mode2,
+};
 
 Adafruit_NeoPixel ring1(RING_PIXEL_COUNT, RING1_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel ring2(RING_PIXEL_COUNT, RING2_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel onboardLed(1, ONBOARD_LED_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_VL53L0X distanceSensor;
-I2SClass i2s;
+Audio audio;
 
+Mode currentMode = Mode::Mode1;
 bool sensorReady = false;
-bool i2sReady = false;
+bool mode2RadioRunning = false;
+bool wifiConnected = false;
+bool radioConnected = false;
+bool hasValidDistance = false;
+float smoothedDistanceM = 0.20f;
 uint16_t ring1Position = 0;
 uint16_t ring2Position = RING_PIXEL_COUNT - 1;
 uint8_t onboardColorIndex = 0;
+uint8_t radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
 uint32_t lastRing1Update = 0;
 uint32_t lastRing2Update = 0;
 uint32_t lastSensorPoll = 0;
 uint32_t lastOnboardUpdate = 0;
+uint32_t lastWifiAttemptMs = 0;
+uint32_t lastVUMeterUpdateMs = 0;
 
 struct OnboardColor {
   const char* name;
@@ -52,13 +69,13 @@ const OnboardColor onboardColors[] = {
 };
 constexpr size_t ONBOARD_COLOR_COUNT = sizeof(onboardColors) / sizeof(onboardColors[0]);
 
-void drawRing1() {
+void drawMode1Ring1() {
   ring1.clear();
   ring1.setPixelColor(ring1Position, ring1.Color(0, 0, 180));
   ring1.show();
 }
 
-void drawRing2() {
+void drawMode1Ring2() {
   ring2.clear();
   ring2.setPixelColor(ring2Position, ring2.Color(0, 180, 0));
   ring2.show();
@@ -74,8 +91,8 @@ void setupNeoPixels() {
   ring1.clear();
   ring2.clear();
   onboardLed.clear();
-  drawRing1();
-  drawRing2();
+  drawMode1Ring1();
+  drawMode1Ring2();
   Serial.println("NeoPixel rings initialized");
 
   onboardLed.setPixelColor(
@@ -85,21 +102,21 @@ void setupNeoPixels() {
   Serial.println("Onboard WS2812 initialized: RED");
 }
 
-void updateRing1() {
+void updateMode1Ring1() {
   const uint32_t now = millis();
   if (now - lastRing1Update >= RING_STEP_MS) {
     lastRing1Update = now;
     ring1Position = (ring1Position + 1) % RING_PIXEL_COUNT;
-    drawRing1();
+    drawMode1Ring1();
   }
 }
 
-void updateRing2() {
+void updateMode1Ring2() {
   const uint32_t now = millis();
   if (now - lastRing2Update >= RING_STEP_MS) {
     lastRing2Update = now;
     ring2Position = (ring2Position + RING_PIXEL_COUNT - 1) % RING_PIXEL_COUNT;
-    drawRing2();
+    drawMode1Ring2();
   }
 }
 
@@ -142,94 +159,18 @@ void updateVL53L0X() {
 
   const uint16_t millimeters = distanceSensor.readRangeResult();
   if (distanceSensor.readRangeStatus() == 0 && millimeters != 0xFFFF) {
-    Serial.print("VL53L0X: ");
-    Serial.print(millimeters / 1000.0f, 3);
-    Serial.println(" m");
-  } else {
-    Serial.print("VL53L0X: invalid reading (range status ");
-    Serial.print(distanceSensor.readRangeStatus());
-    Serial.println(")");
-  }
-}
-
-void setupI2S() {
-  i2s.setPins(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DIN_PIN, -1);
-  i2sReady = i2s.begin(I2S_MODE_STD, AUDIO_SAMPLE_RATE,
-                       I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO,
-                       I2S_STD_SLOT_BOTH);
-  if (i2sReady) {
-    Serial.println("MAX98357A I2S initialized");
-  } else {
-    Serial.println("MAX98357A I2S initialization failed");
-  }
-}
-
-void stopTone() {
-  i2s.end();
-  Serial.println("Audio test complete");
-}
-
-void audioTestTask(void* parameter) {
-  (void)parameter;
-  constexpr size_t BUFFER_SAMPLES = 256;
-  int16_t samples[BUFFER_SAMPLES];
-  uint32_t sampleIndex = 0;
-  const uint32_t toneStartUs = micros();
-
-  while (sampleIndex < AUDIO_SAMPLE_COUNT) {
-    const size_t samplesInBuffer =
-        min(BUFFER_SAMPLES, static_cast<size_t>(AUDIO_SAMPLE_COUNT - sampleIndex));
-    for (size_t index = 0; index < samplesInBuffer; ++index) {
-      const float phase = 2.0f * PI * TONE_FREQUENCY_HZ * sampleIndex / AUDIO_SAMPLE_RATE;
-      samples[index] = static_cast<int16_t>(sinf(phase) * 12000.0f);
-      ++sampleIndex;
-    }
-
-    const size_t bytesToWrite = samplesInBuffer * sizeof(samples[0]);
-    size_t bytesWritten = 0;
-    while (bytesWritten < bytesToWrite) {
-      const size_t written = i2s.write(
-          reinterpret_cast<const uint8_t*>(samples) + bytesWritten,
-          bytesToWrite - bytesWritten);
-      if (written == 0) {
-        if (i2s.lastError() != 0) {
-          Serial.println("Audio test failed while writing I2S samples");
-          stopTone();
-          vTaskDelete(nullptr);
-          return;
-        }
-        vTaskDelay(1);
-      } else {
-        bytesWritten += written;
-      }
-    }
-  }
-
-  while (static_cast<uint32_t>(micros() - toneStartUs) < AUDIO_DURATION_US) {
-    const uint32_t elapsedUs = static_cast<uint32_t>(micros() - toneStartUs);
-    const uint32_t remainingUs = AUDIO_DURATION_US - elapsedUs;
-    if (remainingUs > 2000) {
-      vTaskDelay(pdMS_TO_TICKS((remainingUs - 1000) / 1000));
+    const float distanceM = millimeters / 1000.0f;
+    if (!hasValidDistance) {
+      smoothedDistanceM = distanceM;
+      hasValidDistance = true;
     } else {
-      delayMicroseconds(remainingUs);
+      smoothedDistanceM = (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
     }
-  }
-
-  stopTone();
-  vTaskDelete(nullptr);
-}
-
-void startTone() {
-  Serial.println("Starting 1 kHz audio test");
-  if (!i2sReady) {
-    Serial.println("Audio test skipped: I2S initialization failed");
-    Serial.println("Audio test complete");
-    return;
-  }
-
-  if (xTaskCreate(audioTestTask, "audioTest", 4096, nullptr, 1, nullptr) != pdPASS) {
-    Serial.println("Audio test failed: could not create audio task");
-    stopTone();
+    if (currentMode == Mode::Mode2) {
+      Serial.print("VL53L0X: ");
+      Serial.print(smoothedDistanceM, 3);
+      Serial.println(" m");
+    }
   }
 }
 
@@ -248,6 +189,158 @@ void updateOnboardLED() {
   Serial.println(color.name);
 }
 
+void updateModeButton() {
+  static int lastRawState = HIGH;
+  static uint32_t lastDebounceMs = 0;
+  static int debouncedState = HIGH;
+
+  const int rawState = digitalRead(BUTTON_PIN);
+
+  if (rawState != lastRawState) {
+    lastRawState = rawState;
+    lastDebounceMs = millis();
+  }
+
+  if ((millis() - lastDebounceMs) > DEBOUNCE_MS) {
+    if (rawState != debouncedState) {
+      debouncedState = rawState;
+      if (debouncedState == LOW && currentMode == Mode::Mode1) {
+        currentMode = Mode::Mode2;
+        Serial.println("Mode switch: MODE 1 -> MODE 2");
+        ring1.clear();
+        ring2.clear();
+        ring1.show();
+        ring2.show();
+      }
+    }
+  }
+}
+
+float mapDistanceToVolumePercent(float distanceM) {
+  if (!isfinite(distanceM)) {
+    return DEFAULT_RADIO_VOLUME_PERCENT;
+  }
+
+  if (distanceM <= DISTANCE_NEAR_M) {
+    return 100.0f;
+  }
+
+  if (distanceM >= DISTANCE_FAR_M) {
+    return 0.0f;
+  }
+
+  const float slope = (100.0f - 0.0f) / (DISTANCE_NEAR_M - DISTANCE_FAR_M);
+  const float volume = slope * (distanceM - DISTANCE_FAR_M);
+  return constrain(volume, 0.0f, 100.0f);
+}
+
+void drawVolumeBar(uint8_t volumePercentValue) {
+  ring1.clear();
+
+  uint8_t litPixels = (volumePercentValue * RING_PIXEL_COUNT + 99) / 100;
+  if (litPixels == 0) {
+    litPixels = 1;
+  }
+
+  for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
+    if (index < litPixels) {
+      ring1.setPixelColor(index, ring1.Color(0, 0, 180));
+    }
+  }
+  ring1.show();
+}
+
+void updateVUMeter() {
+  static uint8_t vuLevel = 1;
+  const uint32_t now = millis();
+  if (now - lastVUMeterUpdateMs < 80) {
+    return;
+  }
+  lastVUMeterUpdateMs = now;
+
+  vuLevel = (vuLevel + 1) % (RING_PIXEL_COUNT + 1);
+  if (vuLevel == 0) {
+    vuLevel = 1;
+  }
+
+  ring2.clear();
+  for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
+    if (index < vuLevel) {
+      ring2.setPixelColor(index, ring2.Color(0, 180, 0));
+    }
+  }
+  ring2.show();
+}
+
+void attemptWiFiConnection() {
+  if (wifiConnected) {
+    return;
+  }
+
+  if (lastWifiAttemptMs == 0 || (millis() - lastWifiAttemptMs) >= 5000) {
+    lastWifiAttemptMs = millis();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("Connecting to WiFi...");
+  }
+
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    return;
+  }
+
+  if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL ||
+      status == WL_DISCONNECTED) {
+    Serial.print("WiFi connection failed (status: ");
+    Serial.print(status);
+    Serial.println("). Retrying...");
+  }
+}
+
+void startRadioStream() {
+  if (radioConnected) {
+    return;
+  }
+
+  Serial.println("Starting internet radio stream...");
+  audio.setPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DIN_PIN);
+  audio.setVolume(map(radioVolumePercent, 0, 100, 0, 21));
+  audio.connecttohost(RADIO_STREAM_URL);
+  radioConnected = true;
+}
+
+void updateRadioMode() {
+  if (currentMode != Mode::Mode2) {
+    return;
+  }
+
+  if (!wifiConnected) {
+    attemptWiFiConnection();
+    return;
+  }
+
+  if (!radioConnected) {
+    startRadioStream();
+    return;
+  }
+
+  if (hasValidDistance) {
+    const float computedVolume = mapDistanceToVolumePercent(smoothedDistanceM);
+    radioVolumePercent = static_cast<uint8_t>(constrain(computedVolume, 0.0f, 100.0f));
+  } else {
+    radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
+  }
+
+  drawVolumeBar(radioVolumePercent);
+  updateVUMeter();
+  audio.setVolume(map(radioVolumePercent, 0, 100, 0, 21));
+  audio.loop();
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("========================================");
@@ -263,20 +356,26 @@ void setup() {
   Serial.println("Onboard WS2812: GPIO 48");
   Serial.println("========================================");
 
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   setupNeoPixels();
   setupVL53L0X();
-  setupI2S();
 
   const uint32_t now = millis();
   lastRing1Update = now;
   lastRing2Update = now;
   lastOnboardUpdate = now;
-  startTone();
 }
 
 void loop() {
-  updateRing1();
-  updateRing2();
+  updateModeButton();
   updateVL53L0X();
-  updateOnboardLED();
+
+  if (currentMode == Mode::Mode1) {
+    updateMode1Ring1();
+    updateMode1Ring2();
+    updateOnboardLED();
+    return;
+  }
+
+  updateRadioMode();
 }
