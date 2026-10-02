@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <math.h>
 
+#include "ScreamPlayer.h"
 #include "secrets.h"
 
 constexpr uint8_t BUTTON_PIN = 47;
@@ -17,14 +18,20 @@ constexpr uint8_t I2S_BCLK_PIN = 13;
 constexpr uint8_t I2S_LRC_PIN = 14;
 constexpr uint8_t ONBOARD_LED_PIN = 48;
 constexpr uint16_t RING_PIXEL_COUNT = 12;
-constexpr uint32_t RING_STEP_MS = 120;
 constexpr uint32_t SENSOR_INTERVAL_MS = 250;
 constexpr uint32_t ONBOARD_COLOR_INTERVAL_MS = 1000;
+constexpr uint32_t WIFI_FAILURE_GRACE_MS = 3000;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;
+constexpr uint32_t DEFAULT_RAINBOW_STEP_MS = 100;
+constexpr uint32_t FAST_RAINBOW_STEP_MS = 5;
+constexpr uint8_t RAINBOW_HUE_STEP = 8;
 constexpr uint32_t VU_UPDATE_INTERVAL_MS = 30;
 constexpr uint32_t VU_DECAY_INTERVAL_MS = 60;
 constexpr uint16_t DEBOUNCE_MS = 50;
 constexpr float DISTANCE_NEAR_M = 0.10f;
 constexpr float DISTANCE_FAR_M = 0.30f;
+constexpr float RAINBOW_FAST_DISTANCE_M = 0.20f;
 constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
 constexpr uint16_t VU_THRESHOLDS[RING_PIXEL_COUNT] = {
     300, 500, 800, 1200, 1800, 2600, 3800, 5500, 8000, 11500, 16500, 23000};
@@ -44,22 +51,29 @@ Mode currentMode = Mode::Mode1;
 bool sensorReady = false;
 bool mode2RadioRunning = false;
 bool wifiConnected = false;
+bool usingBackupWiFi = false;
+bool wifiAttemptInProgress = false;
 bool radioConnected = false;
 bool hasValidDistance = false;
+bool screamTriggerArmed = true;
+float currentDistanceM = 0.0f;
 float smoothedDistanceM = 0.20f;
-uint16_t ring1Position = 0;
-uint16_t ring2Position = RING_PIXEL_COUNT - 1;
+uint8_t ring1HueOffset = 0;
+uint8_t ring2HueOffset = 0;
 uint8_t onboardColorIndex = 0;
 uint8_t radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
-uint32_t lastRing1Update = 0;
-uint32_t lastRing2Update = 0;
+uint32_t lastRainbowUpdateMs = 0;
+uint32_t lastScreamFlashUpdateMs = 0;
 uint32_t lastSensorPoll = 0;
 uint32_t lastOnboardUpdate = 0;
-uint32_t lastWifiAttemptMs = 0;
+uint32_t wifiAttemptStartedMs = 0;
+uint32_t nextWifiAttemptMs = 0;
 uint32_t lastVUMeterUpdateMs = 0;
 uint32_t lastVUDecayMs = 0;
+uint16_t lastReportedDistanceMm = 0xFFFF;
 volatile uint16_t pcmPeakAmplitude = 0;
 uint8_t vuLitPixels = 0;
+bool screamFlashOn = false;
 
 void audio_process_i2s(uint32_t* sample, bool* continueI2S) {
   if (continueI2S != nullptr) {
@@ -81,6 +95,85 @@ void audio_process_i2s(uint32_t* sample, bool* continueI2S) {
   }
 }
 
+uint32_t rainbowColor(uint8_t hue) {
+  if (hue < 85) {
+    return ring1.Color(255 - hue * 3, hue * 3, 0);
+  }
+  if (hue < 170) {
+    hue -= 85;
+    return ring1.Color(0, 255 - hue * 3, hue * 3);
+  }
+  hue -= 170;
+  return ring1.Color(hue * 3, 0, 255 - hue * 3);
+}
+
+uint32_t rainbowStepIntervalMs() {
+  if (!screamTriggerArmed || !hasValidDistance ||
+      smoothedDistanceM >= DISTANCE_FAR_M) {
+    return DEFAULT_RAINBOW_STEP_MS;
+  }
+  if (smoothedDistanceM <= RAINBOW_FAST_DISTANCE_M) {
+    return FAST_RAINBOW_STEP_MS;
+  }
+
+  const float proportion =
+      (smoothedDistanceM - RAINBOW_FAST_DISTANCE_M) /
+      (DISTANCE_FAR_M - RAINBOW_FAST_DISTANCE_M);
+  return FAST_RAINBOW_STEP_MS +
+         static_cast<uint32_t>(proportion *
+                               (DEFAULT_RAINBOW_STEP_MS -
+                                FAST_RAINBOW_STEP_MS));
+}
+
+void drawRainbowRing(Adafruit_NeoPixel& ring, uint8_t hueOffset,
+                     bool reverseDirection) {
+  for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
+    const uint8_t pixelHue = reverseDirection
+                                 ? hueOffset - index * 256 / RING_PIXEL_COUNT
+                                 : hueOffset + index * 256 / RING_PIXEL_COUNT;
+    ring.setPixelColor(index, rainbowColor(pixelHue));
+  }
+  ring.show();
+}
+
+void drawScreamFlash(bool on) {
+  const uint32_t color = on ? ring1.Color(255, 0, 0) : 0;
+  for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
+    ring1.setPixelColor(index, color);
+    ring2.setPixelColor(index, color);
+  }
+  ring1.show();
+  ring2.show();
+}
+
+void updateMode1Rings() {
+  const uint32_t now = millis();
+  if (isScreamPlaybackRunning()) {
+    if (now - lastScreamFlashUpdateMs >= 100) {
+      lastScreamFlashUpdateMs = now;
+      screamFlashOn = !screamFlashOn;
+      drawScreamFlash(screamFlashOn);
+    }
+    return;
+  }
+
+  if (screamFlashOn) {
+    screamFlashOn = false;
+    drawRainbowRing(ring1, ring1HueOffset, false);
+    drawRainbowRing(ring2, ring2HueOffset, true);
+    lastRainbowUpdateMs = now;
+  }
+
+  if (now - lastRainbowUpdateMs < rainbowStepIntervalMs()) {
+    return;
+  }
+  lastRainbowUpdateMs = now;
+  ring1HueOffset += RAINBOW_HUE_STEP;
+  ring2HueOffset -= RAINBOW_HUE_STEP;
+  drawRainbowRing(ring1, ring1HueOffset, false);
+  drawRainbowRing(ring2, ring2HueOffset, true);
+}
+
 struct OnboardColor {
   const char* name;
   uint8_t red;
@@ -96,18 +189,6 @@ const OnboardColor onboardColors[] = {
 };
 constexpr size_t ONBOARD_COLOR_COUNT = sizeof(onboardColors) / sizeof(onboardColors[0]);
 
-void drawMode1Ring1() {
-  ring1.clear();
-  ring1.setPixelColor(ring1Position, ring1.Color(0, 0, 180));
-  ring1.show();
-}
-
-void drawMode1Ring2() {
-  ring2.clear();
-  ring2.setPixelColor(ring2Position, ring2.Color(0, 180, 0));
-  ring2.show();
-}
-
 void setupNeoPixels() {
   ring1.begin();
   ring2.begin();
@@ -118,8 +199,8 @@ void setupNeoPixels() {
   ring1.clear();
   ring2.clear();
   onboardLed.clear();
-  drawMode1Ring1();
-  drawMode1Ring2();
+  drawRainbowRing(ring1, ring1HueOffset, false);
+  drawRainbowRing(ring2, ring2HueOffset, true);
   Serial.println("NeoPixel rings initialized");
 
   onboardLed.setPixelColor(
@@ -127,24 +208,6 @@ void setupNeoPixels() {
                            onboardColors[0].blue));
   onboardLed.show();
   Serial.println("Onboard WS2812 initialized: RED");
-}
-
-void updateMode1Ring1() {
-  const uint32_t now = millis();
-  if (now - lastRing1Update >= RING_STEP_MS) {
-    lastRing1Update = now;
-    ring1Position = (ring1Position + 1) % RING_PIXEL_COUNT;
-    drawMode1Ring1();
-  }
-}
-
-void updateMode1Ring2() {
-  const uint32_t now = millis();
-  if (now - lastRing2Update >= RING_STEP_MS) {
-    lastRing2Update = now;
-    ring2Position = (ring2Position + RING_PIXEL_COUNT - 1) % RING_PIXEL_COUNT;
-    drawMode1Ring2();
-  }
 }
 
 void setupVL53L0X() {
@@ -187,17 +250,38 @@ void updateVL53L0X() {
   const uint16_t millimeters = distanceSensor.readRangeResult();
   if (distanceSensor.readRangeStatus() == 0 && millimeters != 0xFFFF) {
     const float distanceM = millimeters / 1000.0f;
+    currentDistanceM = distanceM;
+    if (millimeters != lastReportedDistanceMm) {
+      lastReportedDistanceMm = millimeters;
+      Serial.print("Distance: ");
+      Serial.print(distanceM, 3);
+      Serial.print(" m (");
+      Serial.print(millimeters);
+      Serial.println(" mm)");
+    }
+
     if (!hasValidDistance) {
       smoothedDistanceM = distanceM;
       hasValidDistance = true;
     } else {
       smoothedDistanceM = (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
     }
-    if (currentMode == Mode::Mode2) {
-      Serial.print("VL53L0X: ");
-      Serial.print(smoothedDistanceM, 3);
-      Serial.println(" m");
-    }
+  }
+}
+
+void updateScreamPlayback() {
+  if (!hasValidDistance || currentDistanceM >= DISTANCE_NEAR_M) {
+    screamTriggerArmed = true;
+    return;
+  }
+
+  if (!screamTriggerArmed || isScreamPlaybackRunning()) {
+    return;
+  }
+
+  screamTriggerArmed = false;
+  if (startScreamPlayback(audio)) {
+    Serial.println("Playing proximity scream");
   }
 }
 
@@ -320,28 +404,58 @@ void attemptWiFiConnection() {
     return;
   }
 
-  if (lastWifiAttemptMs == 0 || (millis() - lastWifiAttemptMs) >= 5000) {
-    lastWifiAttemptMs = millis();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.println("Connecting to WiFi...");
-  }
-
+  const uint32_t now = millis();
   const wl_status_t status = WiFi.status();
   if (status == WL_CONNECTED) {
     wifiConnected = true;
+    wifiAttemptInProgress = false;
     Serial.println("WiFi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     return;
   }
 
-  if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL ||
-      status == WL_DISCONNECTED) {
-    Serial.print("WiFi connection failed (status: ");
-    Serial.print(status);
-    Serial.println("). Retrying...");
+  if (wifiAttemptInProgress) {
+    const uint32_t attemptDuration = now - wifiAttemptStartedMs;
+    const bool reportedFailure =
+        status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL;
+    if ((reportedFailure && attemptDuration >= WIFI_FAILURE_GRACE_MS) ||
+        attemptDuration >= WIFI_CONNECT_TIMEOUT_MS) {
+      wifiAttemptInProgress = false;
+      WiFi.disconnect();
+
+      if (!usingBackupWiFi) {
+        usingBackupWiFi = true;
+        nextWifiAttemptMs = now;
+        Serial.println("Primary WiFi unavailable; trying backup credentials");
+      } else {
+        nextWifiAttemptMs = now + WIFI_RETRY_INTERVAL_MS;
+        Serial.println("Backup WiFi unavailable; will retry");
+      }
+    }
+    return;
   }
+
+  if (static_cast<int32_t>(now - nextWifiAttemptMs) < 0) {
+    return;
+  }
+
+  if (!usingBackupWiFi &&
+      (WIFI_SSID[0] == '\0' || WIFI_PASSWORD[0] == '\0')) {
+    usingBackupWiFi = true;
+    Serial.println("Primary WiFi credentials empty; using backup credentials");
+  }
+
+  WiFi.mode(WIFI_STA);
+  if (usingBackupWiFi) {
+    WiFi.begin(BACKUP_WIFI_SSID, BACKUP_WIFI_PASSWORD);
+    Serial.println("Connecting to backup WiFi...");
+  } else {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("Connecting to primary WiFi...");
+  }
+  wifiAttemptStartedMs = now;
+  wifiAttemptInProgress = true;
 }
 
 void startRadioStream() {
@@ -358,6 +472,10 @@ void startRadioStream() {
 
 void updateRadioMode() {
   if (currentMode != Mode::Mode2) {
+    return;
+  }
+
+  if (isScreamPlaybackRunning()) {
     return;
   }
 
@@ -387,7 +505,7 @@ void updateRadioMode() {
 void setup() {
   Serial.begin(115200);
   Serial.println("========================================");
-  Serial.println("FREENOVE ESP32-S3 HARDWARE TEST");
+  Serial.println("FREENOVE ESP32-S3 MAIN OPERATION");
   Serial.println("========================================");
   Serial.println("NeoPixel Ring 1: GPIO 4");
   Serial.println("NeoPixel Ring 2: GPIO 5");
@@ -404,8 +522,7 @@ void setup() {
   setupVL53L0X();
 
   const uint32_t now = millis();
-  lastRing1Update = now;
-  lastRing2Update = now;
+  lastRainbowUpdateMs = now;
   lastOnboardUpdate = now;
 }
 
@@ -414,8 +531,8 @@ void loop() {
   updateVL53L0X();
 
   if (currentMode == Mode::Mode1) {
-    updateMode1Ring1();
-    updateMode1Ring2();
+    updateMode1Rings();
+    updateScreamPlayback();
     updateOnboardLED();
     return;
   }
