@@ -20,10 +20,14 @@ constexpr uint16_t RING_PIXEL_COUNT = 12;
 constexpr uint32_t RING_STEP_MS = 120;
 constexpr uint32_t SENSOR_INTERVAL_MS = 250;
 constexpr uint32_t ONBOARD_COLOR_INTERVAL_MS = 1000;
+constexpr uint32_t VU_UPDATE_INTERVAL_MS = 30;
+constexpr uint32_t VU_DECAY_INTERVAL_MS = 60;
 constexpr uint16_t DEBOUNCE_MS = 50;
 constexpr float DISTANCE_NEAR_M = 0.10f;
 constexpr float DISTANCE_FAR_M = 0.30f;
 constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
+constexpr uint16_t VU_THRESHOLDS[RING_PIXEL_COUNT] = {
+    300, 500, 800, 1200, 1800, 2600, 3800, 5500, 8000, 11500, 16500, 23000};
 
 enum class Mode {
   Mode1,
@@ -53,6 +57,29 @@ uint32_t lastSensorPoll = 0;
 uint32_t lastOnboardUpdate = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastVUMeterUpdateMs = 0;
+uint32_t lastVUDecayMs = 0;
+volatile uint16_t pcmPeakAmplitude = 0;
+uint8_t vuLitPixels = 0;
+
+void audio_process_i2s(uint32_t* sample, bool* continueI2S) {
+  if (continueI2S != nullptr) {
+    *continueI2S = true;
+  }
+  if (sample == nullptr) {
+    return;
+  }
+
+  const int16_t left = static_cast<int16_t>(*sample >> 16);
+  const int16_t right = static_cast<int16_t>(*sample & 0xFFFF);
+  const uint16_t leftAmplitude =
+      static_cast<uint16_t>(abs(static_cast<int32_t>(left)));
+  const uint16_t rightAmplitude =
+      static_cast<uint16_t>(abs(static_cast<int32_t>(right)));
+  const uint16_t amplitude = max(leftAmplitude, rightAmplitude);
+  if (amplitude > pcmPeakAmplitude) {
+    pcmPeakAmplitude = amplitude;
+  }
+}
 
 struct OnboardColor {
   const char* name;
@@ -251,22 +278,38 @@ void drawVolumeBar(uint8_t volumePercentValue) {
 }
 
 void updateVUMeter() {
-  static uint8_t vuLevel = 1;
   const uint32_t now = millis();
-  if (now - lastVUMeterUpdateMs < 80) {
+  if (now - lastVUMeterUpdateMs < VU_UPDATE_INTERVAL_MS) {
     return;
   }
   lastVUMeterUpdateMs = now;
 
-  vuLevel = (vuLevel + 1) % (RING_PIXEL_COUNT + 1);
-  if (vuLevel == 0) {
-    vuLevel = 1;
+  const uint16_t peakAmplitude = pcmPeakAmplitude;
+  pcmPeakAmplitude = 0;
+
+  uint8_t detectedPixels = 0;
+  for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
+    if (peakAmplitude >= VU_THRESHOLDS[index]) {
+      detectedPixels = index + 1;
+    }
+  }
+
+  if (detectedPixels > vuLitPixels) {
+    vuLitPixels = detectedPixels;
+    lastVUDecayMs = now;
+  } else if (vuLitPixels > 0 && now - lastVUDecayMs >= VU_DECAY_INTERVAL_MS) {
+    --vuLitPixels;
+    lastVUDecayMs = now;
   }
 
   ring2.clear();
   for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
-    if (index < vuLevel) {
-      ring2.setPixelColor(index, ring2.Color(0, 180, 0));
+    if (index < vuLitPixels) {
+      if (index < 8) {
+        ring2.setPixelColor(index, ring2.Color(0, 180, 0));
+      } else {
+        ring2.setPixelColor(index, ring2.Color(180, 0, 0));
+      }
     }
   }
   ring2.show();
@@ -336,9 +379,9 @@ void updateRadioMode() {
   }
 
   drawVolumeBar(radioVolumePercent);
-  updateVUMeter();
   audio.setVolume(map(radioVolumePercent, 0, 100, 0, 21));
   audio.loop();
+  updateVUMeter();
 }
 
 void setup() {
