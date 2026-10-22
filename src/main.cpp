@@ -26,12 +26,12 @@ constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;
 constexpr uint32_t DEFAULT_RAINBOW_STEP_MS = 100;
 constexpr uint32_t FAST_RAINBOW_STEP_MS = 5;
 constexpr uint8_t RAINBOW_HUE_STEP = 8;
+constexpr uint32_t SCREAM_LED_UPDATE_INTERVAL_MS = 33;
 constexpr uint32_t VU_UPDATE_INTERVAL_MS = 30;
 constexpr uint32_t VU_DECAY_INTERVAL_MS = 60;
 constexpr uint16_t DEBOUNCE_MS = 50;
 constexpr float DISTANCE_NEAR_M = 0.10f;
 constexpr float DISTANCE_FAR_M = 0.30f;
-constexpr float RAINBOW_FAST_DISTANCE_M = 0.20f;
 constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
 constexpr uint16_t VU_THRESHOLDS[RING_PIXEL_COUNT] = {
     300, 500, 800, 1200, 1800, 2600, 3800, 5500, 8000, 11500, 16500, 23000};
@@ -63,7 +63,7 @@ uint8_t ring2HueOffset = 0;
 uint8_t onboardColorIndex = 0;
 uint8_t radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
 uint32_t lastRainbowUpdateMs = 0;
-uint32_t lastScreamFlashUpdateMs = 0;
+uint32_t lastScreamLedUpdateMs = 0;
 uint32_t lastSensorPoll = 0;
 uint32_t lastOnboardUpdate = 0;
 uint32_t wifiAttemptStartedMs = 0;
@@ -73,7 +73,7 @@ uint32_t lastVUDecayMs = 0;
 uint16_t lastReportedDistanceMm = 0xFFFF;
 volatile uint16_t pcmPeakAmplitude = 0;
 uint8_t vuLitPixels = 0;
-bool screamFlashOn = false;
+bool screamLedMode = false;
 
 void audio_process_i2s(uint32_t* sample, bool* continueI2S) {
   if (continueI2S != nullptr) {
@@ -108,21 +108,20 @@ uint32_t rainbowColor(uint8_t hue) {
 }
 
 uint32_t rainbowStepIntervalMs() {
-  if (!screamTriggerArmed || !hasValidDistance ||
-      smoothedDistanceM >= DISTANCE_FAR_M) {
+  if (!hasValidDistance || smoothedDistanceM >= DISTANCE_FAR_M) {
     return DEFAULT_RAINBOW_STEP_MS;
   }
-  if (smoothedDistanceM <= RAINBOW_FAST_DISTANCE_M) {
+  if (smoothedDistanceM <= DISTANCE_NEAR_M) {
     return FAST_RAINBOW_STEP_MS;
   }
 
   const float proportion =
-      (smoothedDistanceM - RAINBOW_FAST_DISTANCE_M) /
-      (DISTANCE_FAR_M - RAINBOW_FAST_DISTANCE_M);
-  return FAST_RAINBOW_STEP_MS +
-         static_cast<uint32_t>(proportion *
-                               (DEFAULT_RAINBOW_STEP_MS -
-                                FAST_RAINBOW_STEP_MS));
+      (smoothedDistanceM - DISTANCE_NEAR_M) /
+      (DISTANCE_FAR_M - DISTANCE_NEAR_M);
+  return FAST_RAINBOW_STEP_MS + static_cast<uint32_t>(
+                                    proportion *
+                                    (DEFAULT_RAINBOW_STEP_MS -
+                                     FAST_RAINBOW_STEP_MS));
 }
 
 void drawRainbowRing(Adafruit_NeoPixel& ring, uint8_t hueOffset,
@@ -136,8 +135,8 @@ void drawRainbowRing(Adafruit_NeoPixel& ring, uint8_t hueOffset,
   ring.show();
 }
 
-void drawScreamFlash(bool on) {
-  const uint32_t color = on ? ring1.Color(255, 0, 0) : 0;
+void drawScreamLevel(uint8_t level) {
+  const uint32_t color = ring1.Color(level, 0, 0);
   for (uint8_t index = 0; index < RING_PIXEL_COUNT; ++index) {
     ring1.setPixelColor(index, color);
     ring2.setPixelColor(index, color);
@@ -149,19 +148,20 @@ void drawScreamFlash(bool on) {
 void updateMode1Rings() {
   const uint32_t now = millis();
   if (isScreamPlaybackRunning()) {
-    if (now - lastScreamFlashUpdateMs >= 100) {
-      lastScreamFlashUpdateMs = now;
-      screamFlashOn = !screamFlashOn;
-      drawScreamFlash(screamFlashOn);
+    screamLedMode = true;
+    if (now - lastScreamLedUpdateMs >= SCREAM_LED_UPDATE_INTERVAL_MS) {
+      lastScreamLedUpdateMs = now;
+      drawScreamLevel(screamPlaybackLevel());
     }
     return;
   }
 
-  if (screamFlashOn) {
-    screamFlashOn = false;
+  if (screamLedMode) {
+    screamLedMode = false;
+    lastRainbowUpdateMs = now;
     drawRainbowRing(ring1, ring1HueOffset, false);
     drawRainbowRing(ring2, ring2HueOffset, true);
-    lastRainbowUpdateMs = now;
+    return;
   }
 
   if (now - lastRainbowUpdateMs < rainbowStepIntervalMs()) {

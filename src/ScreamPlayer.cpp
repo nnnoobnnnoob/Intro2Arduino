@@ -15,6 +15,7 @@ constexpr size_t FRAMES_PER_BUFFER = 256;
 constexpr uint32_t I2S_DRAIN_DELAY_MS = 100;
 
 volatile bool playbackRunning = false;
+volatile uint8_t playbackLevel = 0;
 Audio* activeAudio = nullptr;
 
 void screamPlaybackTask(void* parameter) {
@@ -22,6 +23,7 @@ void screamPlaybackTask(void* parameter) {
   bool succeeded = false;
   uint32_t stereoFrames[FRAMES_PER_BUFFER];
   Audio* const audio = activeAudio;
+  playbackLevel = 0;
 
   if (audio == nullptr ||
       !audio->setPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DIN_PIN) ||
@@ -39,12 +41,19 @@ void screamPlaybackTask(void* parameter) {
       const size_t frames = remainingSamples < FRAMES_PER_BUFFER
                                 ? remainingSamples
                                 : FRAMES_PER_BUFFER;
+      uint16_t peakAmplitude = 0;
       for (size_t frame = 0; frame < frames; ++frame) {
-        const uint16_t sample =
-            static_cast<uint16_t>(audioData[sampleIndex + frame]);
+        const int16_t signedSample = audioData[sampleIndex + frame];
+        const uint16_t sample = static_cast<uint16_t>(signedSample);
+        const uint16_t amplitude = static_cast<uint16_t>(
+            abs(static_cast<int32_t>(signedSample)));
+        peakAmplitude = max(peakAmplitude, amplitude);
         stereoFrames[frame] =
             (static_cast<uint32_t>(sample) << 16) | sample;
       }
+      playbackLevel = peakAmplitude >= 32640
+                          ? 255
+                          : static_cast<uint8_t>(peakAmplitude >> 7);
 
       const size_t bytesToWrite = frames * sizeof(stereoFrames[0]);
       size_t bytesWritten = 0;
@@ -76,6 +85,7 @@ void screamPlaybackTask(void* parameter) {
     }
   }
 
+  playbackLevel = 0;
   playbackRunning = false;
   activeAudio = nullptr;
   vTaskDelete(nullptr);
@@ -89,6 +99,7 @@ bool startScreamPlayback(Audio& audio) {
   }
 
   activeAudio = &audio;
+  playbackLevel = 0;
   playbackRunning = true;
   if (xTaskCreate(screamPlaybackTask, "screamPlayback", 4096, nullptr, 1,
                   nullptr) != pdPASS) {
@@ -102,4 +113,8 @@ bool startScreamPlayback(Audio& audio) {
 
 bool isScreamPlaybackRunning() {
   return playbackRunning;
+}
+
+uint8_t screamPlaybackLevel() {
+  return playbackLevel;
 }
