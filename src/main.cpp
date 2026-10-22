@@ -30,8 +30,8 @@ constexpr uint32_t SCREAM_LED_UPDATE_INTERVAL_MS = 33;
 constexpr uint32_t VU_UPDATE_INTERVAL_MS = 30;
 constexpr uint32_t VU_DECAY_INTERVAL_MS = 60;
 constexpr uint16_t DEBOUNCE_MS = 50;
-constexpr float DISTANCE_NEAR_M = 0.10f;
-constexpr float DISTANCE_FAR_M = 0.30f;
+constexpr float DISTANCE_NEAR_M = 0.20f;
+constexpr float DISTANCE_FAR_M = 1.5f;
 constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
 constexpr uint16_t VU_THRESHOLDS[RING_PIXEL_COUNT] = {
     300, 500, 800, 1200, 1800, 2600, 3800, 5500, 8000, 11500, 16500, 23000};
@@ -164,9 +164,14 @@ void updateMode1Rings() {
     return;
   }
 
-  if (now - lastRainbowUpdateMs < rainbowStepIntervalMs()) {
+  uint32_t ms_update = rainbowStepIntervalMs();
+  if (now - lastRainbowUpdateMs < ms_update) {
     return;
   }
+  // Serial.print(" ms_update: ");
+  // Serial.println(ms_update);
+    
+
   lastRainbowUpdateMs = now;
   ring1HueOffset += RAINBOW_HUE_STEP;
   ring2HueOffset -= RAINBOW_HUE_STEP;
@@ -232,12 +237,28 @@ void setupVL53L0X() {
   Serial.println("VL53L0X initialized");
 }
 
+
+const float MAX_DISTANCE_M = DISTANCE_FAR_M;
+
+// Set true to print detailed diagnostic information.
+const bool SENSOR_DEBUG = true;
+
+// Print a diagnostic report every 1000 ms.
+const uint32_t SENSOR_DEBUG_INTERVAL_MS = 1000;
+
+uint32_t lastSensorDebug = 0;
+
 void updateVL53L0X() {
+  const uint32_t now = millis();
+
   if (!sensorReady) {
+    if (SENSOR_DEBUG && now - lastSensorDebug >= SENSOR_DEBUG_INTERVAL_MS) {
+      lastSensorDebug = now;
+      Serial.println("[VL53L0X] ERROR: Sensor not ready");
+    }
     return;
   }
 
-  const uint32_t now = millis();
   if (now - lastSensorPoll < 5) {
     return;
   }
@@ -247,27 +268,128 @@ void updateVL53L0X() {
     return;
   }
 
+  // Read the result and status for this completed measurement.
   const uint16_t millimeters = distanceSensor.readRangeResult();
-  if (distanceSensor.readRangeStatus() == 0 && millimeters != 0xFFFF) {
-    const float distanceM = millimeters / 1000.0f;
-    currentDistanceM = distanceM;
-    if (millimeters != lastReportedDistanceMm) {
-      lastReportedDistanceMm = millimeters;
-      Serial.print("Distance: ");
-      Serial.print(distanceM, 3);
-      Serial.print(" m (");
-      Serial.print(millimeters);
-      Serial.println(" mm)");
+  const uint8_t rangeStatus = distanceSensor.readRangeStatus();
+
+  const bool validReading =
+      ((rangeStatus == 2 || rangeStatus == 0 )&& millimeters != 0xFFFF);
+
+  if (validReading) {
+    float distanceM = millimeters / 1000.0f;
+
+    // Clamp the distance to the supported control range.
+    if (distanceM > MAX_DISTANCE_M) {
+      distanceM = MAX_DISTANCE_M;
     }
+
+    currentDistanceM = distanceM;
 
     if (!hasValidDistance) {
       smoothedDistanceM = distanceM;
       hasValidDistance = true;
     } else {
-      smoothedDistanceM = (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
+      smoothedDistanceM =
+          (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
     }
+
+    if (millimeters != lastReportedDistanceMm) {
+      lastReportedDistanceMm = millimeters;
+
+      Serial.print("[VL53L0X] Distance: ");
+      Serial.print(distanceM, 3);
+      Serial.print(" m (");
+      Serial.print(millimeters);
+      Serial.println(" mm)");
+    }
+  } else {
+    // Invalid measurement: use the default maximum distance.
+    currentDistanceM = MAX_DISTANCE_M;
+    smoothedDistanceM = MAX_DISTANCE_M;
+    hasValidDistance = false;
+
+    Serial.print("[VL53L0X] INVALID READING | Status: ");
+    Serial.print(rangeStatus);
+    Serial.print(" | Raw distance: ");
+    Serial.print(millimeters);
+    Serial.print(" mm | Defaulting to ");
+    Serial.print(MAX_DISTANCE_M);
+    Serial.println("m");
+  }
+
+  // Periodic diagnostics, even when the distance hasn't changed.
+  if (SENSOR_DEBUG &&
+      now - lastSensorDebug >= SENSOR_DEBUG_INTERVAL_MS) {
+    lastSensorDebug = now;
+
+    Serial.println("--- VL53L0X Diagnostics ---");
+    Serial.print("Sensor ready: ");
+    Serial.println(sensorReady ? "YES" : "NO");
+
+    Serial.print("Measurement valid: ");
+    Serial.println(validReading ? "YES" : "NO");
+
+    Serial.print("Raw distance: ");
+    Serial.print(millimeters);
+    Serial.println(" mm");
+
+    Serial.print("Range status: ");
+    Serial.println(rangeStatus);
+
+    Serial.print("Current distance: ");
+    Serial.print(currentDistanceM, 3);
+    Serial.println(" m");
+
+    Serial.print("Smoothed distance: ");
+    Serial.print(smoothedDistanceM, 3);
+    Serial.println(" m");
+
+    Serial.print("Has valid distance: ");
+    Serial.println(hasValidDistance ? "YES" : "NO");
+
+    Serial.println("---------------------------");
   }
 }
+
+
+// void updateVL53L0X() {
+//   if (!sensorReady) {
+//     return;
+//   }
+
+//   const uint32_t now = millis();
+//   if (now - lastSensorPoll < 5) {
+//     return;
+//   }
+//   lastSensorPoll = now;
+
+//   if (!distanceSensor.isRangeComplete()) {
+//     return;
+//   }
+
+  
+
+//   const uint16_t millimeters = distanceSensor.readRangeResult();
+//   if (distanceSensor.readRangeStatus() == 0 && millimeters != 0xFFFF) {
+//     const float distanceM = millimeters / 1000.0f;
+//     currentDistanceM = distanceM;
+//     if (millimeters != lastReportedDistanceMm) {
+//       lastReportedDistanceMm = millimeters;
+//       Serial.print("Distance: ");
+//       Serial.print(distanceM, 3);
+//       Serial.print(" m (");
+//       Serial.print(millimeters);
+//       Serial.println(" mm)");
+//     }
+
+//     if (!hasValidDistance) {
+//       smoothedDistanceM = distanceM;
+//       hasValidDistance = true;
+//     } else {
+//       smoothedDistanceM = (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
+//     }
+//   }
+// }
 
 void updateScreamPlayback() {
   if (!hasValidDistance || currentDistanceM >= DISTANCE_NEAR_M) {
