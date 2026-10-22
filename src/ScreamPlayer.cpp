@@ -1,8 +1,9 @@
 #include <Arduino.h>
 
 #include "ScreamPlayer.h"
-//#include "scream.h"
-#include "sweep.h"
+// #include "scream.h"
+#include "scream_cut_compressor.h"
+// #include "sweep.h"
 
 namespace {
 
