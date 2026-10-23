@@ -3,8 +3,8 @@
 #include "ScreamPlayer.h"
 
 // #include "scream.h"
-#include "i_feel_good.h"
-// #include "scream_cut_compressor.h"
+//#include "i_feel_good.h"
+#include "scream_cut_compressor.h"
 // #include "sweep.h"
 
 namespace {

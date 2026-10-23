@@ -28,10 +28,12 @@ constexpr uint32_t FAST_RAINBOW_STEP_MS = 5;
 constexpr uint8_t RAINBOW_HUE_STEP = 8;
 constexpr uint32_t SCREAM_LED_UPDATE_INTERVAL_MS = 33;
 constexpr uint32_t VU_UPDATE_INTERVAL_MS = 30;
-constexpr uint32_t VU_DECAY_INTERVAL_MS = 60;
+constexpr uint32_t VU_DECAY_INTERVAL_MS = 30;
 constexpr uint16_t DEBOUNCE_MS = 50;
 constexpr float DISTANCE_NEAR_M = 0.20f;
 constexpr float DISTANCE_FAR_M = 1.5f;
+constexpr float DISTANCE_FAR_M_RADIO = 0.2f;
+constexpr float DISTANCE_NEAR_M_RADIO = 0.05f;
 constexpr uint8_t DEFAULT_RADIO_VOLUME_PERCENT = 50;
 constexpr uint16_t VU_THRESHOLDS[RING_PIXEL_COUNT] = {
     300, 500, 800, 1200, 1800, 2600, 3800, 5500, 8000, 11500, 16500, 23000};
@@ -241,7 +243,7 @@ void setupVL53L0X() {
 const float MAX_DISTANCE_M = DISTANCE_FAR_M;
 
 // Set true to print detailed diagnostic information.
-const bool SENSOR_DEBUG = true;
+const bool SENSOR_DEBUG = false;
 
 // Print a diagnostic report every 1000 ms.
 const uint32_t SENSOR_DEBUG_INTERVAL_MS = 1000;
@@ -272,15 +274,26 @@ void updateVL53L0X() {
   const uint16_t millimeters = distanceSensor.readRangeResult();
   const uint8_t rangeStatus = distanceSensor.readRangeStatus();
 
-  const bool validReading =
-      ((rangeStatus == 2 || rangeStatus == 0 )&& millimeters != 0xFFFF);
+    const bool validReading =
+      (((currentMode == Mode::Mode1 && rangeStatus == 2) || rangeStatus == 0 )&& millimeters != 0xFFFF);
+  
 
   if (validReading) {
     float distanceM = millimeters / 1000.0f;
 
-    // Clamp the distance to the supported control range.
+    switch (currentMode) {
+    case Mode::Mode1:
+      // In Mode 1, we use the full range of the sensor.
+          // Clamp the distance to the supported control range.
     if (distanceM > MAX_DISTANCE_M) {
       distanceM = MAX_DISTANCE_M;
+    }
+      break;
+      case Mode::Mode2:
+      // In Mode 2, we limit the distance to the radio control range.
+          if (distanceM > DISTANCE_FAR_M_RADIO) {
+        distanceM = DISTANCE_FAR_M_RADIO;
+      }
     }
 
     currentDistanceM = distanceM;
@@ -304,17 +317,34 @@ void updateVL53L0X() {
     }
   } else {
     // Invalid measurement: use the default maximum distance.
-    currentDistanceM = MAX_DISTANCE_M;
-    smoothedDistanceM = MAX_DISTANCE_M;
-    hasValidDistance = false;
+    if (currentMode == Mode::Mode1)
+    {
+      currentDistanceM = MAX_DISTANCE_M;
+      smoothedDistanceM = MAX_DISTANCE_M;
+      hasValidDistance = false;
 
-    Serial.print("[VL53L0X] INVALID READING | Status: ");
-    Serial.print(rangeStatus);
-    Serial.print(" | Raw distance: ");
-    Serial.print(millimeters);
-    Serial.print(" mm | Defaulting to ");
-    Serial.print(MAX_DISTANCE_M);
-    Serial.println("m");
+      Serial.print("[VL53L0X] INVALID READING | Status: ");
+      Serial.print(rangeStatus);
+      Serial.print(" | Raw distance: ");
+      Serial.print(millimeters);
+      Serial.print(" mm | Defaulting to ");
+      Serial.print(MAX_DISTANCE_M);
+      Serial.println("m");
+    } 
+    else if (currentMode == Mode::Mode2) {
+      // currentDistanceM = DISTANCE_FAR_M_RADIO;
+      // smoothedDistanceM = DISTANCE_FAR_M_RADIO;
+      hasValidDistance = false;
+
+      Serial.print("[VL53L0X] INVALID READING | Status: ");
+      Serial.print(rangeStatus);
+      Serial.print(" | Raw distance: ");
+      Serial.println(millimeters);
+
+    }
+
+
+
   }
 
   // Periodic diagnostics, even when the distance hasn't changed.
@@ -350,46 +380,6 @@ void updateVL53L0X() {
     Serial.println("---------------------------");
   }
 }
-
-
-// void updateVL53L0X() {
-//   if (!sensorReady) {
-//     return;
-//   }
-
-//   const uint32_t now = millis();
-//   if (now - lastSensorPoll < 5) {
-//     return;
-//   }
-//   lastSensorPoll = now;
-
-//   if (!distanceSensor.isRangeComplete()) {
-//     return;
-//   }
-
-  
-
-//   const uint16_t millimeters = distanceSensor.readRangeResult();
-//   if (distanceSensor.readRangeStatus() == 0 && millimeters != 0xFFFF) {
-//     const float distanceM = millimeters / 1000.0f;
-//     currentDistanceM = distanceM;
-//     if (millimeters != lastReportedDistanceMm) {
-//       lastReportedDistanceMm = millimeters;
-//       Serial.print("Distance: ");
-//       Serial.print(distanceM, 3);
-//       Serial.print(" m (");
-//       Serial.print(millimeters);
-//       Serial.println(" mm)");
-//     }
-
-//     if (!hasValidDistance) {
-//       smoothedDistanceM = distanceM;
-//       hasValidDistance = true;
-//     } else {
-//       smoothedDistanceM = (smoothedDistanceM * 0.7f) + (distanceM * 0.3f);
-//     }
-//   }
-// }
 
 void updateScreamPlayback() {
   if (!hasValidDistance || currentDistanceM >= DISTANCE_NEAR_M) {
@@ -454,16 +444,16 @@ float mapDistanceToVolumePercent(float distanceM) {
     return DEFAULT_RADIO_VOLUME_PERCENT;
   }
 
-  if (distanceM <= DISTANCE_NEAR_M) {
+  if (distanceM <= DISTANCE_NEAR_M_RADIO) {
     return 100.0f;
   }
 
-  if (distanceM >= DISTANCE_FAR_M) {
+  if (distanceM >= DISTANCE_FAR_M_RADIO) {
     return 0.0f;
   }
 
-  const float slope = (100.0f - 0.0f) / (DISTANCE_NEAR_M - DISTANCE_FAR_M);
-  const float volume = slope * (distanceM - DISTANCE_FAR_M);
+  const float slope = (100.0f - 0.0f) / (DISTANCE_NEAR_M_RADIO - DISTANCE_FAR_M_RADIO);
+  const float volume = slope * (distanceM - DISTANCE_FAR_M_RADIO);
   return constrain(volume, 0.0f, 100.0f);
 }
 
@@ -615,7 +605,7 @@ void updateRadioMode() {
     const float computedVolume = mapDistanceToVolumePercent(smoothedDistanceM);
     radioVolumePercent = static_cast<uint8_t>(constrain(computedVolume, 0.0f, 100.0f));
   } else {
-    radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
+    //radioVolumePercent = DEFAULT_RADIO_VOLUME_PERCENT;
   }
 
   drawVolumeBar(radioVolumePercent);
